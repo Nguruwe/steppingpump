@@ -2,24 +2,25 @@
 #include <Adafruit_ST7735.h>
 #include <Adafruit_MAX31865.h>
 #include <Encoder.h>
+#include <TimerOne.h>
 
 // ===== ПИНЫ ДИСПЛЕЯ =====
 #define TFT_CS    10
 #define TFT_RST   8
 #define TFT_DC    9
-#define TFT_BL    5     // Пин подсветки (ШИМ)
+#define TFT_BL    5
 
 // ===== ПИНЫ ЭНКОДЕРА =====
 #define ENC_CLK   2
 #define ENC_DT    3
 #define ENC_SW    4
 
-// ===== ПИНЫ ДРАЙВЕРА ШАГОВОГО МОТОРА =====
+// ===== ПИНЫ ДРАЙВЕРА =====
 #define DRV_EN    15   // A1
 #define DRV_STEP  16   // A2
 #define DRV_DIR   17   // A3
 
-// ===== ПИНЫ И НАСТРОЙКИ MAX31865 =====
+// ===== ПИНЫ MAX31865 =====
 #define MAX_CS    7
 #define MAX_SDI   6
 #define MAX_SDO   12
@@ -38,16 +39,16 @@ int lastPos = 0;
 int lastRotationDir = 0;
 bool lastButtonPressed = false;
 bool buttonPressed = false;
-bool lastButtonState = HIGH;   // <-- ДОБАВИТЬ ЭТУ СТРОКУ
+bool lastButtonState = HIGH;
 int rotationDir = 0;
 
 // ===== ПЕРЕМЕННЫЕ МОТОРА =====
-bool motorEnabled = false;          // Состояние драйвера (вкл/выкл)
-long motorSpeed = 0;                // Скорость: положительная — вперёд, отрицательная — назад, 0 — стоп
-unsigned long lastStepTime = 0;     // Время последнего шага
-unsigned long stepInterval = 0;     // Интервал между шагами (мкс)
+volatile bool motorEnabled = false;
+volatile long motorSpeed = 0;          // -500..+500, знак = направление
+volatile unsigned long stepInterval = 0;  // мкс между шагами
+volatile bool stepState = false;       // для генерации короткого импульса
 
-// ===== ПЕРЕМЕННЫЕ ТЕМПЕРАТУРЫ =====
+// ===== ТЕМПЕРАТУРА =====
 float currentTemp = 0.0;
 float lastTemp = -999.0;
 unsigned long lastTempUpdate = 0;
@@ -55,36 +56,56 @@ unsigned long lastTempUpdate = 0;
 // ===== ЯРКОСТЬ =====
 int brightness = 32;
 
+// ===== ISR ТАЙМЕРА =====
+// Каждое срабатывание таймера формирует один импульс STEP.
+// Импульс делается в два захода: HIGH на одном срабатывании, LOW на следующем.
+// Благодаря этому длительность импульса равна периоду таймера и не блокирует loop().
+void stepISR() {
+  if (!motorEnabled || motorSpeed == 0 || stepInterval == 0) {
+    digitalWrite(DRV_STEP, LOW);
+    stepState = false;
+    return;
+  }
+  
+  if (!stepState) {
+    // Направление выставляем перед импульсом
+    digitalWrite(DRV_DIR, (motorSpeed > 0) ? HIGH : LOW);
+    digitalWrite(DRV_STEP, HIGH);
+    stepState = true;
+  } else {
+    digitalWrite(DRV_STEP, LOW);
+    stepState = false;
+  }
+}
+
 void setup() {
   Serial.begin(9600);
   
-  // Инициализация дисплея
   tft.initR(INITR_BLACKTAB);
   tft.setRotation(1);
   
-  // Инициализация датчика температуры
   thermo.begin(MAX31865_4WIRE);
   
-  // Настройка подсветки
   pinMode(TFT_BL, OUTPUT);
   analogWrite(TFT_BL, brightness);
   
-  // Настройка кнопки энкодера
   pinMode(ENC_SW, INPUT_PULLUP);
   
-  // Настройка пинов драйвера
   pinMode(DRV_EN, OUTPUT);
   pinMode(DRV_STEP, OUTPUT);
   pinMode(DRV_DIR, OUTPUT);
   
-  // Драйвер выключен (EN активен низким уровнем — HIGH = выключен)
-  digitalWrite(DRV_EN, HIGH);
+  digitalWrite(DRV_EN, HIGH);   // выключен
   digitalWrite(DRV_STEP, LOW);
   digitalWrite(DRV_DIR, LOW);
   
+  // Инициализация Timer1: 1000 мкс = 1 кГц, при запуске мотор выключен
+  Timer1.initialize(1000);
+  Timer1.attachInterrupt(stepISR);
+  
   tft.fillScreen(ST77XX_BLACK);
   
-  Serial.println("=== TFT + Энкодер + MAX31865 + DRV8825 ===");
+  Serial.println("=== TFT + Энкодер + MAX31865 + DRV8825 (Timer1) ===");
   
   drawStaticInterface();
   updateTemperatureUI();
@@ -94,26 +115,35 @@ void setup() {
 }
 
 void loop() {
-  // ----- 1. ЭНКОДЕР: УПРАВЛЕНИЕ СКОРОСТЬЮ -----
+  // ----- 1. ЭНКОДЕР -----
   int newPos = myEncoder.read() / 4;
   if (newPos != lastPos) {
     int delta = newPos - lastPos;
     
-    // Меняем скорость в зависимости от поворота
-    // Чем больше повернули — тем быстрее
-    motorSpeed += delta * 5;   // Шаг изменения скорости
+    // Временно разрешаем менять скорость
+    noInterrupts();
+    motorSpeed += delta * 5;
     motorSpeed = constrain(motorSpeed, -500, 500);
+    long spd = motorSpeed;
+    interrupts();
     
-    if (motorSpeed > 0) rotationDir = 1;
-    else if (motorSpeed < 0) rotationDir = -1;
+    if (spd > 0) rotationDir = 1;
+    else if (spd < 0) rotationDir = -1;
     else rotationDir = 0;
     
-    // Пересчёт интервала шага (мкс). Чем больше скорость, тем меньше интервал.
-    if (motorSpeed == 0) {
+    if (spd == 0) {
       stepInterval = 0;
+      noInterrupts();
+      motorSpeed = 0;
+      interrupts();
     } else {
-      // 500 — макс. скорость (интервал 400 мкс), 1 — мин. скорость (интервал 20000 мкс)
-      stepInterval = map(abs(motorSpeed), 1, 500, 20000, 400);
+      // Чем больше |speed|, тем меньше интервал.
+      // Диапазон интервалов: 400 мкс (быстро) ... 20000 мкс (медленно)
+      unsigned long interval = map(abs(spd), 1, 500, 20000, 400);
+      noInterrupts();
+      stepInterval = interval;
+      interrupts();
+      Timer1.setPeriod(interval);
     }
     
     lastPos = newPos;
@@ -121,45 +151,35 @@ void loop() {
     updateMotorUI();
   }
 
-  // ----- 2. КНОПКА: ВКЛ/ВЫКЛ ДРАЙВЕРА -----
+  // ----- 2. КНОПКА -----
   bool currentButtonState = digitalRead(ENC_SW);
   if (currentButtonState == LOW && lastButtonState == HIGH) {
     buttonPressed = !buttonPressed;
-    motorEnabled = buttonPressed;
     
-    if (motorEnabled) {
-      digitalWrite(DRV_EN, LOW);   // Включаем драйвер
+    noInterrupts();
+    motorEnabled = buttonPressed;
+    interrupts();
+    
+    if (buttonPressed) {
+      digitalWrite(DRV_EN, LOW);
       Serial.println("Motor ON");
     } else {
-      digitalWrite(DRV_EN, HIGH);  // Выключаем драйвер
-      motorSpeed = 0;              // Сбрасываем скорость
+      digitalWrite(DRV_EN, HIGH);
+      noInterrupts();
+      motorSpeed = 0;
       stepInterval = 0;
+      interrupts();
+      digitalWrite(DRV_STEP, LOW);
       Serial.println("Motor OFF");
     }
     
     updateButtonUI();
     updateMotorUI();
-    delay(50); // Дебаунс
+    delay(50); // дебаунс кнопки — теперь безопасен, т.к. шаги идут в ISR
   }
   lastButtonState = currentButtonState;
 
-  // ----- 3. ГЕНЕРАЦИЯ ШАГОВ (БЕЗ delay) -----
-  if (motorEnabled && motorSpeed != 0 && stepInterval > 0) {
-    unsigned long now = micros();
-    if (now - lastStepTime >= stepInterval) {
-      lastStepTime = now;
-      
-      // Направление
-      digitalWrite(DRV_DIR, motorSpeed > 0 ? HIGH : LOW);
-      
-      // Импульс шага
-      digitalWrite(DRV_STEP, HIGH);
-      delayMicroseconds(5);   // Минимальная длительность импульса
-      digitalWrite(DRV_STEP, LOW);
-    }
-  }
-
-  // ----- 4. ТЕМПЕРАТУРА -----
+  // ----- 3. ТЕМПЕРАТУРА -----
   if (millis() - lastTempUpdate >= 500) {
     lastTempUpdate = millis();
     
@@ -206,17 +226,14 @@ void updateTemperatureUI() {
   tft.setTextSize(3);
   
   if (currentTemp == -999.0) {
-    tft.setTextColor(ST77XX_RED, ST77XX_BLACK); 
-    tft.print("ERR   "); 
+    tft.setTextColor(ST77XX_RED, ST77XX_BLACK);
+    tft.print("ERR   ");
   } else {
-    tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK); 
-    tft.print(currentTemp, 3); 
+    tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
+    tft.print(currentTemp, 3);
     
-    if (currentTemp < 10.0) {
-      tft.print("  ");
-    } else if (currentTemp < 100.0) {
-      tft.print(" ");
-    }
+    if (currentTemp < 10.0) tft.print("  ");
+    else if (currentTemp < 100.0) tft.print(" ");
   }
 }
 
@@ -235,7 +252,7 @@ void updateEncoderUI() {
     lastRotationDir = rotationDir;
   }
   
-  tft.fillRect(30, 148, 45, 10, ST77XX_BLACK); 
+  tft.fillRect(30, 148, 45, 10, ST77XX_BLACK);
   tft.setTextColor(ST77XX_CYAN);
   tft.setTextSize(1);
   tft.setCursor(5, 150);
@@ -256,14 +273,14 @@ void updateButtonUI() {
   }
 }
 
-// ===== МОТОР (ИНФО НА ЭКРАНЕ) =====
+// ===== МОТОР =====
 void updateMotorUI() {
   tft.fillRect(80, 70, 45, 10, ST77XX_BLACK);
   tft.setTextColor(ST77XX_ORANGE);
   tft.setTextSize(1);
   tft.setCursor(80, 72);
   tft.print("V:");
-  tft.print(motorSpeed);
+  tft.print((long)motorSpeed);
 }
 
 // ===== ЯРКОСТЬ =====
