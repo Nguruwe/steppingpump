@@ -44,14 +44,19 @@ int rotationDir = 0;
 
 // ===== ПЕРЕМЕННЫЕ МОТОРА =====
 volatile bool motorEnabled = false;
-volatile long motorSpeed = 0;          // -500..+500, знак = направление
-volatile unsigned long stepInterval = 0;  // мкс между шагами
-volatile bool stepState = false;       // для генерации короткого импульса
+volatile long flowRate = 0;                // мл/ч, знак = направление
+volatile unsigned long stepInterval = 0;   // мкс между шагами
+volatile bool stepState = false;
 
-// ===== НАСТРОЙКИ СКОРОСТИ =====
-const long MAX_SPEED = 2000;            // верхняя граница «единиц»
-const unsigned long MIN_INTERVAL = 50;  // мкс, самый быстрый шаг (20 кГц)
-const unsigned long MAX_INTERVAL = 20000; // мкс, самый медленный шаг
+// ===== КАЛИБРОВКА НАСОСА =====
+const float ML_PER_REV = 1.0;              // мл за один оборот (пока наугад)
+const float STEPS_PER_REV = 3200.0;        // 1/16 шага для 1.8° мотора
+const long  MAX_FLOW = 2000;               // максимальный отбор, мл/ч
+const long  MIN_FLOW = 1;                  // минимальный отбор, мл/ч
+
+// ===== ГРАНИЦЫ ПЕРИОДА TIMER1 =====
+const unsigned long MIN_INTERVAL = 50;     // мкс (20 кГц — предел для digitalWrite ISR)
+const unsigned long MAX_INTERVAL = 200000; // мкс (очень медленно, для малых потоков)
 
 // ===== ТЕМПЕРАТУРА =====
 float currentTemp = 0.0;
@@ -62,19 +67,15 @@ unsigned long lastTempUpdate = 0;
 int brightness = 32;
 
 // ===== ISR ТАЙМЕРА =====
-// Каждое срабатывание таймера формирует один импульс STEP.
-// Импульс делается в два захода: HIGH на одном срабатывании, LOW на следующем.
-// Благодаря этому длительность импульса равна периоду таймера и не блокирует loop().
 void stepISR() {
-  if (!motorEnabled || motorSpeed == 0 || stepInterval == 0) {
+  if (!motorEnabled || flowRate == 0 || stepInterval == 0) {
     digitalWrite(DRV_STEP, LOW);
     stepState = false;
     return;
   }
   
   if (!stepState) {
-    // Направление выставляем перед импульсом
-    digitalWrite(DRV_DIR, (motorSpeed > 0) ? HIGH : LOW);
+    digitalWrite(DRV_DIR, (flowRate > 0) ? HIGH : LOW);
     digitalWrite(DRV_STEP, HIGH);
     stepState = true;
   } else {
@@ -104,7 +105,6 @@ void setup() {
   digitalWrite(DRV_STEP, LOW);
   digitalWrite(DRV_DIR, LOW);
   
-  // Инициализация Timer1: 1000 мкс = 1 кГц, при запуске мотор выключен
   Timer1.initialize(1000);
   Timer1.attachInterrupt(stepISR);
   
@@ -120,26 +120,43 @@ void setup() {
 }
 
 void loop() {
-  // ----- 1. ЭНКОДЕР -----
+  // ----- 1. ЭНКОДЕР: УПРАВЛЕНИЕ ПОТОКОМ (мл/ч) -----
   int newPos = myEncoder.read() / 4;
   if (newPos != lastPos) {
     int delta = newPos - lastPos;
     
-    // Временно разрешаем менять скорость 
+    // Шаг изменения зависит от текущего значения:
+    // на малых — точнее, на больших — быстрее
+    long step = 1;
+    if (abs(flowRate) >= 100)  step = 10;
+    if (abs(flowRate) >= 500)  step = 50;
+    if (abs(flowRate) >= 1000) step = 100;
+    
     noInterrupts();
-    motorSpeed += delta * 5;
-    motorSpeed = constrain(motorSpeed, -MAX_SPEED, MAX_SPEED);
-
-    long spd = motorSpeed;
+    flowRate += delta * step;
+    flowRate = constrain(flowRate, -MAX_FLOW, MAX_FLOW);
+    long spd = flowRate;
+    interrupts();
+    
     if (spd > 0) rotationDir = 1;
     else if (spd < 0) rotationDir = -1;
     else rotationDir = 0;
-
+    
     if (spd == 0) {
+      noInterrupts();
       stepInterval = 0;
+      interrupts();
+      Timer1.setPeriod(1000000);   // холостой период
     } else {
-      unsigned long interval = map(abs(spd), 1, MAX_SPEED, MAX_INTERVAL, MIN_INTERVAL);
+      // об/сек = мл/ч / 3600 / (мл/об)
+      float rev_per_sec   = fabs(spd) / 3600.0 / ML_PER_REV;
+      float steps_per_sec = rev_per_sec * STEPS_PER_REV;
+      unsigned long interval = (unsigned long)(1000000.0 / steps_per_sec);
+      interval = constrain(interval, MIN_INTERVAL, MAX_INTERVAL);
+      
+      noInterrupts();
       stepInterval = interval;
+      interrupts();
       Timer1.setPeriod(interval);
     }
     
@@ -163,7 +180,7 @@ void loop() {
     } else {
       digitalWrite(DRV_EN, HIGH);
       noInterrupts();
-      motorSpeed = 0;
+      flowRate = 0;
       stepInterval = 0;
       interrupts();
       digitalWrite(DRV_STEP, LOW);
@@ -172,7 +189,7 @@ void loop() {
     
     updateButtonUI();
     updateMotorUI();
-    delay(50); // дебаунс кнопки — теперь безопасен, т.к. шаги идут в ISR
+    delay(50);
   }
   lastButtonState = currentButtonState;
 
@@ -234,7 +251,7 @@ void updateTemperatureUI() {
   }
 }
 
-// ===== ЭНКОДЕР =====
+// ===== ЭНКОДЕР (UI) =====
 void updateEncoderUI() {
   if (rotationDir != lastRotationDir) {
     tft.fillRect(20, 102, 75, 20, ST77XX_BLACK);
@@ -277,7 +294,7 @@ void updateMotorUI() {
   tft.setTextSize(1);
   tft.setCursor(80, 72);
   tft.print("V:");
-  tft.print((long)motorSpeed);
+  tft.print((long)flowRate);
 }
 
 // ===== ЯРКОСТЬ =====
