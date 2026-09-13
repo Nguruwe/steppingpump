@@ -14,99 +14,156 @@
 #define ENC_DT    3
 #define ENC_SW    4
 
+// ===== ПИНЫ ДРАЙВЕРА ШАГОВОГО МОТОРА =====
+#define DRV_EN    15   // A1
+#define DRV_STEP  16   // A2
+#define DRV_DIR   17   // A3
+
 // ===== ПИНЫ И НАСТРОЙКИ MAX31865 =====
-#define MAX_CS    7     // Наш свободный пин для CS температурного модуля
-#define RREF      4300.0  // Наш новый впаянный резистор 1206 на 4.3 кОм
-#define RNOMINAL  1000.0  // Номинал датчика PT1000 при 0°C
+#define MAX_CS    7
+#define MAX_SDI   6
+#define MAX_SDO   12
+#define MAX_CLK   14
+
+#define RREF      4300.0
+#define RNOMINAL  1000.0
 
 // ===== ОБЪЕКТЫ =====
 Adafruit_ST7735 tft = Adafruit_ST7735(TFT_CS, TFT_DC, TFT_RST);
 Encoder myEncoder(ENC_CLK, ENC_DT);
-
-// Используем аппаратный SPI для MAX31865 (передаем только пин CS)
-// Он автоматически займет общие с дисплеем пины D11 (MOSI) и D13 (SCK), а также свободный D12 (MISO)
-#define MAX_CS   7
-#define MAX_SDI  6   // Перенесли с 11
-#define MAX_SDO  12  // Оставили на 12
-#define MAX_CLK  14  // Перенесли с 13 на пин A0 (цифровой 14)
-
-// Инициализация программного SPI: (CS, MOSI, MISO, CLK)
 Adafruit_MAX31865 thermo = Adafruit_MAX31865(MAX_CS, MAX_SDI, MAX_SDO, MAX_CLK);
 
-// ===== ПЕРЕМЕННЫЕ =====
-int lastRotationDir = 0;   // Чтобы стрелки не мерцали, если направление не менялось
-bool lastButtonPressed = false; // Чтобы квадрат кнопки не мерцал
-
+// ===== ПЕРЕМЕННЫЕ ЭНКОДЕРА =====
 int lastPos = 0;
-bool lastButtonState = HIGH;
+int lastRotationDir = 0;
+bool lastButtonPressed = false;
 bool buttonPressed = false;
+bool lastButtonState = HIGH;   // <-- ДОБАВИТЬ ЭТУ СТРОКУ
 int rotationDir = 0;
-int brightness = 32;
 
+// ===== ПЕРЕМЕННЫЕ МОТОРА =====
+bool motorEnabled = false;          // Состояние драйвера (вкл/выкл)
+long motorSpeed = 0;                // Скорость: положительная — вперёд, отрицательная — назад, 0 — стоп
+unsigned long lastStepTime = 0;     // Время последнего шага
+unsigned long stepInterval = 0;     // Интервал между шагами (мкс)
+
+// ===== ПЕРЕМЕННЫЕ ТЕМПЕРАТУРЫ =====
 float currentTemp = 0.0;
-float lastTemp = -999.0; // Для отслеживания изменений температуры
+float lastTemp = -999.0;
 unsigned long lastTempUpdate = 0;
+
+// ===== ЯРКОСТЬ =====
+int brightness = 32;
 
 void setup() {
   Serial.begin(9600);
   
-  // Инициализация дисплея и поворот на 90°
+  // Инициализация дисплея
   tft.initR(INITR_BLACKTAB);
-  tft.setRotation(1); // 90° по часовой стрелке
+  tft.setRotation(1);
   
-  // Инициализация датчика температуры в режиме 4-проводного подключения
+  // Инициализация датчика температуры
   thermo.begin(MAX31865_4WIRE);
   
-  // Настройка подсветки (ШИМ)
+  // Настройка подсветки
   pinMode(TFT_BL, OUTPUT);
   analogWrite(TFT_BL, brightness);
   
   // Настройка кнопки энкодера
   pinMode(ENC_SW, INPUT_PULLUP);
   
+  // Настройка пинов драйвера
+  pinMode(DRV_EN, OUTPUT);
+  pinMode(DRV_STEP, OUTPUT);
+  pinMode(DRV_DIR, OUTPUT);
+  
+  // Драйвер выключен (EN активен низким уровнем — HIGH = выключен)
+  digitalWrite(DRV_EN, HIGH);
+  digitalWrite(DRV_STEP, LOW);
+  digitalWrite(DRV_DIR, LOW);
+  
   tft.fillScreen(ST77XX_BLACK);
   
-  Serial.println("=== TFT + Энкодер + MAX31865 PT1000 тест ===");
+  Serial.println("=== TFT + Энкодер + MAX31865 + DRV8825 ===");
   
-  // Рисуем интерфейс (один раз статические элементы)
   drawStaticInterface();
   updateTemperatureUI();
   updateEncoderUI();
   updateButtonUI();
+  updateMotorUI();
 }
 
 void loop() {
-  // ----- 1. ЧИТАЕМ И ОБНОВЛЯЕМ ЭНКОДЕР -----
+  // ----- 1. ЭНКОДЕР: УПРАВЛЕНИЕ СКОРОСТЬЮ -----
   int newPos = myEncoder.read() / 4;
   if (newPos != lastPos) {
     int delta = newPos - lastPos;
-    if (delta > 0) rotationDir = -1;  // Влево
-    else rotationDir = 1;              // Вправо
+    
+    // Меняем скорость в зависимости от поворота
+    // Чем больше повернули — тем быстрее
+    motorSpeed += delta * 5;   // Шаг изменения скорости
+    motorSpeed = constrain(motorSpeed, -500, 500);
+    
+    if (motorSpeed > 0) rotationDir = 1;
+    else if (motorSpeed < 0) rotationDir = -1;
+    else rotationDir = 0;
+    
+    // Пересчёт интервала шага (мкс). Чем больше скорость, тем меньше интервал.
+    if (motorSpeed == 0) {
+      stepInterval = 0;
+    } else {
+      // 500 — макс. скорость (интервал 400 мкс), 1 — мин. скорость (интервал 20000 мкс)
+      stepInterval = map(abs(motorSpeed), 1, 500, 20000, 400);
+    }
     
     lastPos = newPos;
-    
-    // Обновляем НА ЭКРАНЕ только данные энкодера, температуру не трогаем!
     updateEncoderUI();
+    updateMotorUI();
   }
 
-  // ----- 2. ЧИТАЕМ И ОБНОВЛЯЕМ КНОПКУ -----
+  // ----- 2. КНОПКА: ВКЛ/ВЫКЛ ДРАЙВЕРА -----
   bool currentButtonState = digitalRead(ENC_SW);
   if (currentButtonState == LOW && lastButtonState == HIGH) {
     buttonPressed = !buttonPressed;
+    motorEnabled = buttonPressed;
     
-    // Обновляем НА ЭКРАНЕ только кнопку!
+    if (motorEnabled) {
+      digitalWrite(DRV_EN, LOW);   // Включаем драйвер
+      Serial.println("Motor ON");
+    } else {
+      digitalWrite(DRV_EN, HIGH);  // Выключаем драйвер
+      motorSpeed = 0;              // Сбрасываем скорость
+      stepInterval = 0;
+      Serial.println("Motor OFF");
+    }
+    
     updateButtonUI();
+    updateMotorUI();
     delay(50); // Дебаунс
   }
   lastButtonState = currentButtonState;
 
-  // ----- 3. ЧИТАЕМ И ОБНОВЛЯЕМ ТЕМПЕРАТУРУ -----
+  // ----- 3. ГЕНЕРАЦИЯ ШАГОВ (БЕЗ delay) -----
+  if (motorEnabled && motorSpeed != 0 && stepInterval > 0) {
+    unsigned long now = micros();
+    if (now - lastStepTime >= stepInterval) {
+      lastStepTime = now;
+      
+      // Направление
+      digitalWrite(DRV_DIR, motorSpeed > 0 ? HIGH : LOW);
+      
+      // Импульс шага
+      digitalWrite(DRV_STEP, HIGH);
+      delayMicroseconds(5);   // Минимальная длительность импульса
+      digitalWrite(DRV_STEP, LOW);
+    }
+  }
+
+  // ----- 4. ТЕМПЕРАТУРА -----
   if (millis() - lastTempUpdate >= 500) {
     lastTempUpdate = millis();
     
-    // Перед чтением сбрасываем старые ошибки, которые могли прилететь от переходного процесса
-    thermo.clearFault(); 
-    // Читаем температуру
+    thermo.clearFault();
     float tempReading = thermo.temperature(RNOMINAL, RREF);
     
     uint8_t fault = thermo.readFault();
@@ -117,7 +174,6 @@ void loop() {
       currentTemp = tempReading;
     }
     
-    // Если температура РЕАЛЬНО изменилась — обновляем НА ЭКРАНЕ только её!
     if (currentTemp != lastTemp) {
       updateTemperatureUI();
       lastTemp = currentTemp;
@@ -125,18 +181,15 @@ void loop() {
   }
 }
 
-// ===== ОТРИСОВКА СТАТИКИ (вызывается один раз в setup) =====
+// ===== СТАТИЧЕСКИЙ ИНТЕРФЕЙС =====
 void drawStaticInterface() {
-  // Рамка
   tft.drawRect(0, 0, tft.width(), tft.height(), ST77XX_WHITE);
   
-  // Буква "С" для температуры
   tft.setTextColor(ST77XX_WHITE);
   tft.setTextSize(2);
   tft.setCursor(115, 60);
   tft.print("C");
   
-  // Статичный текст внизу
   tft.setTextColor(ST77XX_MAGENTA);
   tft.setTextSize(1);
   tft.setCursor(80, 150);
@@ -147,37 +200,30 @@ void drawStaticInterface() {
   tft.print(brightness);
 }
 
-// ===== ОБНОВЛЕНИЕ ДИНАМИЧЕСКИХ ДАННЫХ (без мерцания всего экрана) =====
-// ===== 1. ОБНОВЛЕНИЕ ТОЛЬКО ТЕМПЕРАТУРЫ =====
+// ===== ТЕМПЕРАТУРА =====
 void updateTemperatureUI() {
   tft.setCursor(15, 55);
   tft.setTextSize(3);
   
   if (currentTemp == -999.0) {
-    // Выводим ошибку и принудительно затираем пробелами всё оставшееся место
     tft.setTextColor(ST77XX_RED, ST77XX_BLACK); 
     tft.print("ERR   "); 
   } else {
     tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK); 
     tft.print(currentTemp, 3); 
     
-    // Выравниваем длину строки пробелами:
-    // Если температура < 10.00 (на экране 4 символа, например 8.54), добавляем 2 пробела
     if (currentTemp < 10.0) {
       tft.print("  ");
-    }
-    // Если температура < 100.00 (на экране 5 символов, например 24.35), добавляем 1 пробел
-    else if (currentTemp < 100.0) {
+    } else if (currentTemp < 100.0) {
       tft.print(" ");
     }
-    // Если 100.00 и выше (6 символов), пробелы не нужны — строка и так максимальной длины
   }
 }
-// ===== 2. ОБНОВЛЕНИЕ ТОЛЬКО ДАННЫХ ЭНКОДЕРА =====
+
+// ===== ЭНКОДЕР =====
 void updateEncoderUI() {
-  // Стрелки направления обновляем только если направление РЕАЛЬНО изменилось
   if (rotationDir != lastRotationDir) {
-    tft.fillRect(20, 102, 75, 20, ST77XX_BLACK); // Затираем только стрелку
+    tft.fillRect(20, 102, 75, 20, ST77XX_BLACK);
     tft.setTextSize(2);
     tft.setTextColor(ST77XX_YELLOW);
     tft.setCursor(25, 105);
@@ -189,7 +235,6 @@ void updateEncoderUI() {
     lastRotationDir = rotationDir;
   }
   
-  // Цифры позиции энкодера (затираем и пишем заново только само число)
   tft.fillRect(30, 148, 45, 10, ST77XX_BLACK); 
   tft.setTextColor(ST77XX_CYAN);
   tft.setTextSize(1);
@@ -198,7 +243,7 @@ void updateEncoderUI() {
   tft.print(lastPos);
 }
 
-// ===== 3. ОБНОВЛЕНИЕ ТОЛЬКО КВАДРАТА КНОПКИ =====
+// ===== КНОПКА =====
 void updateButtonUI() {
   if (buttonPressed != lastButtonPressed) {
     if (buttonPressed) {
@@ -211,12 +256,21 @@ void updateButtonUI() {
   }
 }
 
-// ===== ФУНКЦИЯ УПРАВЛЕНИЯ ЯРКОСТЬЮ =====
+// ===== МОТОР (ИНФО НА ЭКРАНЕ) =====
+void updateMotorUI() {
+  tft.fillRect(80, 70, 45, 10, ST77XX_BLACK);
+  tft.setTextColor(ST77XX_ORANGE);
+  tft.setTextSize(1);
+  tft.setCursor(80, 72);
+  tft.print("V:");
+  tft.print(motorSpeed);
+}
+
+// ===== ЯРКОСТЬ =====
 void setBrightness(int value) {
   brightness = constrain(value, 0, 255);
   analogWrite(TFT_BL, brightness);
   
-  // Обновляем циферки яркости в углу
   tft.fillRect(25, 3, 25, 10, ST77XX_BLACK);
   tft.setTextColor(ST77XX_MAGENTA);
   tft.setTextSize(1);
