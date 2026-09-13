@@ -52,7 +52,7 @@ volatile unsigned long stepInterval = 0;   // мкс между шагами
 volatile bool stepState = false;
 
 // ===== КАЛИБРОВКА НАСОСА =====
-const float ML_PER_REV = 0.09;             // мл за один оборот (предварительно)
+const float ML_PER_REV = 0.088;             // мл за один оборот (предварительно)
 const float STEPS_PER_REV = 3200.0;        // 1/16 шага для 1.8° мотора
 const long  MAX_FLOW = 2000;               // максимальный отбор, мл/ч
 
