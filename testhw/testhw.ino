@@ -48,6 +48,11 @@ volatile long motorSpeed = 0;          // -500..+500, знак = направл�
 volatile unsigned long stepInterval = 0;  // мкс между шагами
 volatile bool stepState = false;       // для генерации короткого импульса
 
+// ===== НАСТРОЙКИ СКОРОСТИ =====
+const long MAX_SPEED = 2000;            // верхняя граница «единиц»
+const unsigned long MIN_INTERVAL = 50;  // мкс, самый быстрый шаг (20 кГц)
+const unsigned long MAX_INTERVAL = 20000; // мкс, самый медленный шаг
+
 // ===== ТЕМПЕРАТУРА =====
 float currentTemp = 0.0;
 float lastTemp = -999.0;
@@ -120,29 +125,21 @@ void loop() {
   if (newPos != lastPos) {
     int delta = newPos - lastPos;
     
-    // Временно разрешаем менять скорость
+    // Временно разрешаем менять скорость 
     noInterrupts();
     motorSpeed += delta * 5;
-    motorSpeed = constrain(motorSpeed, -500, 500);
+    motorSpeed = constrain(motorSpeed, -MAX_SPEED, MAX_SPEED);
+
     long spd = motorSpeed;
-    interrupts();
-    
     if (spd > 0) rotationDir = 1;
     else if (spd < 0) rotationDir = -1;
     else rotationDir = 0;
-    
+
     if (spd == 0) {
       stepInterval = 0;
-      noInterrupts();
-      motorSpeed = 0;
-      interrupts();
     } else {
-      // Чем больше |speed|, тем меньше интервал.
-      // Диапазон интервалов: 400 мкс (быстро) ... 20000 мкс (медленно)
-      unsigned long interval = map(abs(spd), 1, 500, 20000, 400);
-      noInterrupts();
+      unsigned long interval = map(abs(spd), 1, MAX_SPEED, MAX_INTERVAL, MIN_INTERVAL);
       stepInterval = interval;
-      interrupts();
       Timer1.setPeriod(interval);
     }
     
